@@ -1,0 +1,46 @@
+{
+  "_comment": "Static configuration. Rarely changes. el_version is the CLUSTER's EL, not the build box's.",
+  "hauler": {
+    "advertise_host": "hauler.ham.lan",
+    "work_dir": "/opt/hauler",
+    "store_dir": "/opt/hauler/store",
+    "fileserver_dir": "/opt/hauler/fileserver",
+    "registry_port": 5000,
+    "fileserver_port": 8080
+  },
+  "dnf_repo": {
+    "host": "repo.ham.lan",
+    "repo_dirs": {
+      "el8": "/mnt/reposhare/rocky8/rke2",
+      "el9": "/mnt/reposhare/rocky9/rke2"
+    },
+    "_comment": "existing releasever-split dnf server; RPM artifact is dropped here (nodes already point at it)"
+  },
+  "platform": "linux/amd64",
+  "el_versions": ["el8", "el9"],
+  "arch_rpm": "x86_64",
+  "rke2": {
+    "selinux_version": "0.21",
+    "selinux_release": "stable.1",
+    "selinux_pkg_release": "1",
+    "exclude_image_patterns": ["sriov", "cilium", "vsphere"]
+  },
+  "helm_deps": [
+    {
+      "name": "cert-manager",
+      "repoURL": "https://charts.jetstack.io",
+      "github_repo": "cert-manager/cert-manager",
+      "image_source": "helm-template",
+      "chart_version_format": "as-is"
+    },
+    {
+      "name": "longhorn",
+      "repoURL": "https://charts.longhorn.io",
+      "github_repo": "longhorn/longhorn",
+      "image_source": "longhorn-images-txt",
+      "chart_version_format": "strip-v"
+    }
+  ],
+  "include_helm_binary": false,
+  "build_dir": "_build"
+}
