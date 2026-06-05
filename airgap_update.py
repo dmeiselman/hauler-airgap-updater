@@ -570,6 +570,12 @@ def cmd_build(args):
     platform = config.get("platform", "linux/amd64")
     exclude = rke2_cfg.get("exclude_image_patterns", [])
 
+    # preflight tool checks — fail before any downloads if tools are missing
+    if not args.dry_run:
+        require("tar")
+        require("zstd")
+        require("hauler")
+
     # --- current version (confirm/override; air-gap value may be hand-supplied)
     state_current = state.get("cluster_current", {}).get("rke2")
     current_tag = args.current or ask(
@@ -653,8 +659,6 @@ def cmd_build(args):
         return
 
     # --- artifact 1: RPM tar (per-EL subdirs) for the dnf repo server
-    require("tar")
-    require("zstd")  # tar -I zstd needs the zstd binary on the build box
     build_dir = config.get("build_dir", "_build")
     rpms_root = os.path.join(build_dir, "rpms")
     if os.path.exists(rpms_root):
@@ -672,7 +676,6 @@ def cmd_build(args):
 
     # --- artifact 2: hauler store (images + charts)
     #    hauler v1.4.3: sync -f <manifest> -s <store>; save -f <out> -s <store>.
-    require("hauler")
     build_store = os.path.join(build_dir, "store")
     warn("hauler store sync — this will take a while...")
     run(["hauler", "store", "sync", "-f", manifest_path, "-s", build_store])
@@ -788,6 +791,11 @@ def render_runbook(path, nodes, rke2_cfg, els, arch, config):
                     out.append(f"    ssh {node['name']} sudo systemctl restart rke2-server")
                     out.append(f"    kubectl wait node/{node['name']} --for=condition=Ready --timeout=300s")
                     out.append(f"    kubectl get node {node['name']} -o jsonpath='{{.status.nodeInfo.kubeletVersion}}'")
+                    out.append(f"    # verify etcd healthy before proceeding to the next server:")
+                    out.append(f"    kubectl -n kube-system exec -it etcd-{node['name']} -- etcdctl endpoint health \\")
+                    out.append(f"      --cacert /var/lib/rancher/rke2/server/tls/etcd/server-ca.crt \\")
+                    out.append(f"      --cert   /var/lib/rancher/rke2/server/tls/etcd/server-client.crt \\")
+                    out.append(f"      --key    /var/lib/rancher/rke2/server/tls/etcd/server-client.key")
                     out.append("")
             else:
                 out.append( "    # (no server nodes in state.json — substitute hostnames)")
@@ -795,6 +803,11 @@ def render_runbook(path, nodes, rke2_cfg, els, arch, config):
                 out.append(f"      {srv_pkg} {com_pkg} {sel_pkg}")
                 out.append( "    ssh <server-node> sudo systemctl restart rke2-server")
                 out.append( "    kubectl wait node/<server-node> --for=condition=Ready --timeout=300s")
+                out.append( "    # verify etcd healthy before proceeding to the next server:")
+                out.append( "    kubectl -n kube-system exec -it etcd-<server-node> -- etcdctl endpoint health \\")
+                out.append( "      --cacert /var/lib/rancher/rke2/server/tls/etcd/server-ca.crt \\")
+                out.append( "      --cert   /var/lib/rancher/rke2/server/tls/etcd/server-client.crt \\")
+                out.append( "      --key    /var/lib/rancher/rke2/server/tls/etcd/server-client.key")
                 out.append("")
 
             out.append(f"  [{el}] Agent nodes — one at a time (only after ALL servers are Ready):")

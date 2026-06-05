@@ -149,7 +149,8 @@ For each minor in the upgrade path (e.g. first `1.33.12`, then `1.34.8`):
 **On each control-plane server, one at a time:**
 
 ```bash
-# substitute <ver> = 1.33.12.rke2r2  and  <sel> = 0.21-1
+# substitute <ver> = 1.33.12~rke2r2  and  <sel> = 0.21-1
+# NOTE: the separator is ~ (tilde), not . (dot) — dnf requires the NEVRA form
 dnf install -y rke2-server-<ver>-0.el9 rke2-common-<ver>-0.el9 rke2-selinux-<sel>.el9
 systemctl restart rke2-server
 
@@ -211,14 +212,18 @@ The hauler bundle **stages** these charts and images — it does **not**
 automatically upgrade them. After the RKE2 upgrade is complete:
 
 ```bash
+# Charts are stored as OCI artifacts in the hauler registry (:5000).
+# Check the exact OCI path with: hauler store info -s /opt/hauler/store
+# Then upgrade using the oci:// scheme — NOT --repo http://
+
 # longhorn example:
-helm upgrade longhorn longhorn/longhorn \
+helm upgrade longhorn oci://hauler.ham.lan:5000/longhorn/longhorn \
   --namespace longhorn-system \
-  --version 1.12.0 \
-  --repo http://hauler.ham.lan:5000   # or OCI URL from hauler registry
+  --version 1.12.0
 ```
 
-Exact syntax depends on how your cluster is configured to reach the hauler registry.
+The OCI path prefix (e.g. `/longhorn/longhorn`) comes from `hauler store info` output.
+Use the `oci://` scheme; `--repo http://` will not work for OCI-stored charts.
 
 ---
 
@@ -232,6 +237,7 @@ Exact syntax depends on how your cluster is configured to reach the hauler regis
 | `last_build.rke2_path` | `build` | Exact upgrade path bundled |
 | `last_build.rpm_bundle` | `build` | Filename of the RPM artifact |
 | `last_build.hauler_bundle` | `build` | Filename of the hauler artifact |
+| `last_build.runbook` | `build` | Filename of the generated upgrade runbook |
 | `last_build.targets` | `build` | Target versions (rke2 + helm deps) |
 
 ---

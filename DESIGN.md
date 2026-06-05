@@ -377,6 +377,13 @@ those workflows are adopted).
 ```
 
 ## 12. Changelog (most-recent first)
+- 2026-06-05 (session 3) — Bug fixes from post-validation review: (1) hoisted
+  `require(tar/zstd/hauler)` to top of `cmd_build` so missing tools fail before
+  any downloads; (2) `render_runbook` now includes etcd health check after each
+  control-plane node upgrade step; (3) OPERATOR.md Step 4c NEVRA corrected from
+  `.` to `~` separator; (4) OPERATOR.md helm upgrade example corrected to OCI
+  `oci://` scheme (not `--repo http://`); (5) `last_build.runbook` added to the
+  state.json reference table.
 - 2026-06-05 (session 2) — **Runbook generation implemented** (was §9 stretch
   goal). `build` writes `runbook_<date>.txt`: per-minor, per-EL, per-node
   version-pinned commands with `kubectl wait` guards. Printed in `--dry-run`,
