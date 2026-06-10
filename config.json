@@ -10,10 +10,6 @@
   },
   "dnf_repo": {
     "host": "repo.ham.lan",
-    "repo_dirs": {
-      "el8": "/mnt/reposhare/rocky8/rke2",
-      "el9": "/mnt/reposhare/rocky9/rke2"
-    },
     "_comment": "existing releasever-split dnf server; RPM artifact is dropped here (nodes already point at it)"
   },
   "platform": "linux/amd64",

@@ -10,5 +10,5 @@ airgap_hauler.yaml
 # discover output that needs manual merge (not the committed state.json)
 state.discovered.json
 
-# generated runbook (carry alongside artifacts; not committed)
-runbook_*.txt
+# generated apply guide
+RUNBOOK.md

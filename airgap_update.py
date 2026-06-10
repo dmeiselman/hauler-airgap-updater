@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""airgap_update.py — build and ingest hauler bundles for in-place RKE2 airgap updates.
+"""airgap_update.py — download artifacts + generate the apply runbook for in-place RKE2 airgap updates.
 
 Subcommands (see DESIGN.md for the full plan):
   discover  online, against a reachable reference cluster — populate state.json
-  build     online hauler store — resolve versions, pull artifacts, make a bundle   [stub]
-  ingest    offline hauler VM   — load bundle into serving store, refresh repo      [stub]
+  build     online — resolve versions, download RPMs + images/charts, emit two
+            tar.zst artifacts and RUNBOOK.md
+  runbook   regenerate RUNBOOK.md from the last build recorded in state.json
 
-Standard library only. Shells out to kubectl / helm / hauler.
+Loading the artifacts into the hauler servers and applying the node upgrade are
+MANUAL steps — the generated RUNBOOK.md spells them out. Standard library only;
+shells out to kubectl / helm / hauler / tar.
 """
 
 import argparse
@@ -245,9 +248,7 @@ USER_AGENT = "airgap-update/0.1"
 RKE2_CHANNELS_URL = "https://update.rke2.io/v1-release/channels"
 
 
-def http_get(url, verbose=False):
-    if verbose:
-        info(f"  GET {url}")
+def http_get(url):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -258,8 +259,8 @@ def http_get(url, verbose=False):
         fatal(f"network error fetching {url}: {e.reason}")
 
 
-def http_get_json(url, verbose=False):
-    return json.loads(http_get(url, verbose=verbose))
+def http_get_json(url):
+    return json.loads(http_get(url))
 
 
 # ----------------------------------------------------------------------------
@@ -292,7 +293,6 @@ def fetch_rke2_minor_latest():
     whose 'latest' is that minor's newest patch — exactly the minor-level data
     the upgrade-path planner needs.
     """
-    info(f"fetching RKE2 channels from {RKE2_CHANNELS_URL}")
     data = http_get_json(RKE2_CHANNELS_URL).get("data", [])
     out = {}
     for ch in data:
@@ -374,9 +374,7 @@ def helm_binary_file():
 # image gathering
 # ----------------------------------------------------------------------------
 def rke2_images_for(tag, exclude_patterns):
-    url = rke2_images_url(tag)
-    info(f"  fetching image list: {url}")
-    text = http_get(url)
+    text = http_get(rke2_images_url(tag))
     imgs = []
     for line in text.splitlines():
         line = line.strip()
@@ -398,7 +396,6 @@ def helm_dep_images(dep, chart_version):
             f"https://github.com/longhorn/longhorn/releases/download/{tag}"
             "/longhorn-images.txt"
         )
-        info(f"    fetching longhorn image list: {url}")
         try:
             return [l.strip() for l in http_get(url).splitlines() if l.strip()]
         except SystemExit:
@@ -406,10 +403,8 @@ def helm_dep_images(dep, chart_version):
             return []
     if src == "helm-template":
         require("helm")
-        info(f"    helm repo add {name} {dep['repoURL']} (timeout 60s)")
         run(["helm", "repo", "add", name, dep["repoURL"], "--force-update"],
             check=False, timeout=60)
-        info(f"    helm template {name}/{name} --version {chart_version} (timeout 120s)")
         rc, out, _ = run(
             ["helm", "template", f"{name}/{name}", "--version", chart_version],
             check=False, timeout=120,
@@ -526,12 +521,10 @@ def resolve_helm_deps(config, state, args):
         gh = dep.get("github_repo")
         latest = None
         if gh:
-            info(f"  fetching latest release for {name} from github.com/{gh}")
             try:
                 latest = http_get_json(
                     f"https://api.github.com/repos/{gh}/releases/latest"
                 )["tag_name"]
-                info(f"    latest: {latest}")
             except SystemExit:
                 warn(f"could not fetch latest release for {name}")
         cur_app = current.get(name, {}).get("app_version")
@@ -570,12 +563,6 @@ def cmd_build(args):
     platform = config.get("platform", "linux/amd64")
     exclude = rke2_cfg.get("exclude_image_patterns", [])
 
-    # preflight tool checks — fail before any downloads if tools are missing
-    if not args.dry_run:
-        require("tar")
-        require("zstd")
-        require("hauler")
-
     # --- current version (confirm/override; air-gap value may be hand-supplied)
     state_current = state.get("cluster_current", {}).get("rke2")
     current_tag = args.current or ask(
@@ -613,12 +600,9 @@ def cmd_build(args):
     for dep in resolve_helm_deps(config, state, args):
         info(f"  staging helm dep {dep['name']} chart {dep['version']}")
         charts.append({"name": dep["name"], "repoURL": dep["repoURL"], "version": dep["version"]})
-        if args.no_helm_images:
-            info(f"    --no-helm-images: skipping image resolution for {dep['name']}")
-        else:
-            imgs = helm_dep_images(dep["_dep"], dep["version"])
-            info(f"    {len(imgs)} images")
-            images.update(imgs)
+        imgs = helm_dep_images(dep["_dep"], dep["version"])
+        info(f"    {len(imgs)} images")
+        images.update(imgs)
 
     # --- optional extra hauler Files (e.g. helm binary; off by default now)
     files = []
@@ -637,26 +621,21 @@ def cmd_build(args):
         f"RPMs to fetch: {rpm_count} ({', '.join(f'{el}={len(rpm_urls[el])}' for el in els)})"
     )
 
-    date = f"{datetime.date.today():%m_%d_%y}"
-
-    # --- runbook (generated early so it's available in --dry-run too)
-    nodes = state.get("cluster_current", {}).get("nodes", [])
-    runbook = render_runbook(path, nodes, rke2_cfg, els, arch, config)
-    runbook_file = f"runbook_{date}.txt"
-    with open(runbook_file, "w") as fh:
-        fh.write(runbook)
-    info(f"wrote {runbook_file}")
-
     if args.dry_run:
         print()
         for el in els:
             print(f"  [{el}] RPM urls:")
             for u in rpm_urls[el]:
                 print(f"    {u}")
-        print()
-        print(runbook)
-        warn("--dry-run: no downloads, no hauler. Review airgap_hauler.yaml, RPM list, and runbook above.")
+        warn("--dry-run: no downloads, no hauler. Review airgap_hauler.yaml + the RPM list above.")
         return
+
+    date = f"{datetime.date.today():%m_%d_%y}"
+
+    # --- fail fast on missing build tools before any downloads
+    require("tar")
+    require("zstd")  # tar -I zstd needs the zstd binary on the build box
+    require("hauler")
 
     # --- artifact 1: RPM tar (per-EL subdirs) for the dnf repo server
     build_dir = config.get("build_dir", "_build")
@@ -688,7 +667,6 @@ def cmd_build(args):
         "timestamp": now_iso(),
         "rpm_bundle": rpm_bundle,
         "hauler_bundle": hauler_bundle,
-        "runbook": runbook_file,
         "rke2_path": path,
         "els": els,
         "targets": {"rke2": path[-1], "helm_deps": {c["name"]: c["version"] for c in charts}},
@@ -696,269 +674,167 @@ def cmd_build(args):
     write_json(args.state, state)
     info(f"updated {args.state}")
 
-    repo_dirs = config.get("dnf_repo", {}).get("repo_dirs", {})
+    # --- generate the operator runbook (manual hauler load + node apply) ----
+    repo_host = config.get("dnf_repo", {}).get("host", "the dnf repo server")
+    store_dir = config.get("hauler", {}).get("store_dir", "/opt/hauler/store")
+    selinux_version = rke2_cfg.get("selinux_version", "")
+    write_runbook(path, els, rpm_bundle, hauler_bundle, store_dir, repo_host,
+                  selinux_version, charts)
 
     print()
-    info("=" * 60)
-    info("ARTIFACT DELIVERY — run these on the target servers")
-    info("=" * 60)
-    print()
-    info(f"1) RPMs  ->  dnf repo server ({config.get('dnf_repo', {}).get('host', 'repo server')})")
-    print(f"   # copy {rpm_bundle} to the repo server, then:")
-    print(f"   mkdir -p <tmpdir> && tar -I zstd -xf {rpm_bundle} -C <tmpdir>")
-    for el in els:
-        dest = repo_dirs.get(el, f"<{el} repo dir>")
-        print(f"   cp <tmpdir>/{el}/*.rpm {dest}/")
-        print(f"   createrepo_c {dest}")
-        print(f"   # SELinux (if enforcing):")
-        print(f"   chcon -Rt httpd_sys_content_t {dest}")
-        print(f"   semanage fcontext -a -t httpd_sys_content_t '{dest}(/.*)?'  # persistent")
-    print()
-    warn("Do NOT use 'dnf update' — the repo holds multiple minors and dnf will skip")
-    warn("intermediates. Pin each step: dnf install -y rke2-server-<ver> rke2-common-<ver>")
-    print()
-    info(f"2) Images + charts  ->  hauler server")
-    print(f"   python3 airgap_update.py ingest {hauler_bundle}")
-    print()
-    info(f"3) Carry runbook alongside artifacts:")
-    print(f"   {runbook_file}  (copy-paste upgrade commands, per-minor per-node)")
-    print()
-    print(runbook)
+    info("two artifacts to carry across the air gap:")
+    print(f"    {rpm_bundle}    -> dnf repo server ({repo_host})")
+    print(f"    {hauler_bundle} -> hauler server(s)")
+    info(f"follow {RUNBOOK_PATH} to load them and apply the upgrade.")
 
 
 # ----------------------------------------------------------------------------
-# runbook generation
+# runbook (operator apply guide, generated by build)
 # ----------------------------------------------------------------------------
-def render_runbook(path, nodes, rke2_cfg, els, arch, config):
-    """Return a copy-paste-ready upgrade runbook string.
+#
+# The tool's job ends at *downloading* the two artifacts. Loading them into the
+# hauler servers and applying the upgrade on the nodes are MANUAL steps — this
+# runbook spells them out with concrete, copy/paste-ready, single-line commands
+# derived from the exact versions and EL releases this build produced.
+RUNBOOK_PATH = "RUNBOOK.md"
 
-    Generates per-minor, per-EL, per-node ordered commands. Servers are listed
-    before agents; within each role, nodes appear one at a time with wait steps.
+
+def _dnf_ver(tag):
+    """('v1.33.12+rke2r2') -> '1.33.12.rke2r2' — the dnf version token to pin."""
+    base, rke2r = parse_tag(tag)
+    return f"{base}.{rke2r}"
+
+
+def render_runbook(path, els, rpm_bundle, hauler_bundle, store_dir, repo_host,
+                   selinux_version, charts):
+    """Return the RUNBOOK.md text: manual hauler load + version-pinned node apply.
+
+    Every command is a single line (no backslash continuations) so it survives
+    copy/paste. Only the EL releases this build covers (`els`) appear.
     """
-    hcfg = config.get("hauler", {})
-    hauler_host = hcfg.get("advertise_host", "hauler")
-    reg_port = hcfg.get("registry_port", 5000)
-    sel_ver = rke2_cfg.get("selinux_version", "0.21")
-    sel_pkgrel = rke2_cfg.get("selinux_pkg_release", "1")
+    sel = f"rke2-selinux-{selinux_version}"
+    L = []
+    L.append("# RKE2 air-gap upgrade runbook")
+    L.append("")
+    L.append(f"Generated by `airgap_update.py build`. Upgrade path: "
+             f"**{' -> '.join(path)}**.")
+    L.append("")
+    L.append("Two artifacts came out of the build — carry both across the gap:")
+    L.append("")
+    L.append(f"- `{rpm_bundle}` -> dnf repo server (`{repo_host}`), EL: "
+             f"{', '.join(els)}")
+    L.append(f"- `{hauler_bundle}` -> hauler server(s) (images + charts)")
+    L.append("")
 
-    servers = [n for n in nodes if n["role"] == "control-plane"]
-    agents  = [n for n in nodes if n["role"] != "control-plane"]
+    # --- 1. RPMs onto the dnf repo server -----------------------------------
+    L.append("## 1. Publish RPMs on the dnf repo server")
+    L.append("")
+    dirs = " ".join(f"./{el}/" for el in els)
+    L.append(f"Copy `{rpm_bundle}` to `{repo_host}` and extract it — it contains "
+             f"one dir per EL ({', '.join(els)}) of `.rpm`s. Drop those into "
+             "wherever your repo serves each releasever and refresh metadata "
+             "(`createrepo`/`createrepo_c`) the way you already do:")
+    L.append("")
+    L.append("```bash")
+    L.append(f"tar -xf {rpm_bundle}   # yields {dirs}")
+    L.append("```")
+    L.append("")
 
-    def sep(char="-", width=68): return char * width
+    # --- 2. Images/charts into each hauler server ---------------------------
+    L.append("## 2. Load images + charts into each hauler server")
+    L.append("")
+    L.append("Run on the internet-connected hauler server AND again on the "
+             f"air-gapped hauler server (after copying `{hauler_bundle}` to it). "
+             f"`-f` points at the bundle, `-s` at the serving store:")
+    L.append("")
+    L.append("```bash")
+    L.append(f"sudo hauler store load -f {hauler_bundle} -s {store_dir}")
+    L.append("sudo systemctl restart hauler@registry hauler@fileserver")
+    L.append(f"hauler store info -s {store_dir}   # verify contents")
+    L.append("```")
+    L.append("")
 
-    out = []
-    out.append(sep("="))
-    out.append("RKE2 UPGRADE RUNBOOK")
-    out.append(f"Generated : {now_iso()}")
-    out.append(f"Path      : {' -> '.join(path)}")
-    out.append(f"EL targets: {', '.join(els)}")
-    out.append(sep("="))
-    out.append("")
-    out.append("PREREQUISITES")
-    out.append( "  1. Snapshot / backup all nodes before starting.")
-    out.append( "  2. Verify hauler registry reachable from nodes:")
-    out.append(f"       curl http://{hauler_host}:{reg_port}/v2/")
-    out.append( "  3. Verify RPMs are present in the dnf repo:")
-    out.append( "       dnf repoquery rke2-server")
-    out.append( "  NOTE: Node names below come from state.json (reference cluster).")
-    out.append( "        Substitute real hostnames for air-gapped target clusters.")
-    out.append("")
+    # --- 3. Node apply, version-pinned, one minor at a time -----------------
+    L.append("## 3. Apply on the nodes (one minor at a time, cluster-wide)")
+    L.append("")
+    L.append("> The repo now holds multiple minors. **Do NOT run a blind "
+             "`dnf update`** — it would jump straight to the newest minor and "
+             "skip the intermediates (Kubernetes can't skip minors). Pin every "
+             "step to the exact version below.")
+    L.append("")
+    L.append("For each step: upgrade the **control-plane servers one at a time** "
+             "(after each `restart`, wait for that node to report `Ready` and "
+             "etcd to be healthy before moving to the next server), **then** the "
+             "**agents one at a time**. Only start the next step once every node "
+             "is on the current one.")
+    L.append("")
+    for i, tag in enumerate(path, 1):
+        v = _dnf_ver(tag)
+        L.append(f"### Step {i}: {tag}")
+        L.append("")
+        L.append("Servers (one at a time):")
+        L.append("")
+        L.append("```bash")
+        L.append(f"sudo dnf install -y rke2-server-{v} rke2-common-{v} {sel}")
+        L.append("sudo systemctl restart rke2-server")
+        L.append("```")
+        L.append("")
+        L.append("Agents (one at a time, after all servers in this step):")
+        L.append("")
+        L.append("```bash")
+        L.append(f"sudo dnf install -y rke2-agent-{v} rke2-common-{v} {sel}")
+        L.append("sudo systemctl restart rke2-agent")
+        L.append("```")
+        L.append("")
+    L.append("> Heads-up (multi-server): `systemctl restart` is the cutover for "
+             "that node, but the cluster's bundled components (coredns, canal, "
+             "ingress-nginx, metrics-server, ...) are reconciled cluster-wide. "
+             "Until a **majority of servers** are on the new version, the lagging "
+             "servers will drag those component versions back down — i.e. a "
+             "half-finished step can appear to \"downgrade\" minutes later. Don't "
+             "stop partway through a step.")
+    L.append("")
 
-    for step_i, tag in enumerate(path, 1):
-        base, rke2r = parse_tag(tag)
-        rpm_ver = f"{base}~{rke2r}-0"
-        out.append(sep("="))
-        out.append(f"MINOR STEP {step_i} of {len(path)}: upgrade to {tag}")
-        out.append(sep("="))
-        out.append("")
-
-        for el in els:
-            srv_pkg = f"rke2-server-{rpm_ver}.{el}.{arch}"
-            agt_pkg = f"rke2-agent-{rpm_ver}.{el}.{arch}"
-            com_pkg = f"rke2-common-{rpm_ver}.{el}.{arch}"
-            sel_pkg = f"rke2-selinux-{sel_ver}-{sel_pkgrel}.{el}.noarch"
-
-            out.append(f"  [{el}] Control-plane servers — one at a time:")
-            out.append( "         Wait for Ready + etcd healthy before proceeding to the next.")
-            out.append("")
-            if servers:
-                for node in servers:
-                    out.append(f"    # {node['name']}")
-                    out.append(f"    ssh {node['name']} sudo dnf install -y \\")
-                    out.append(f"      {srv_pkg} \\")
-                    out.append(f"      {com_pkg} \\")
-                    out.append(f"      {sel_pkg}")
-                    out.append(f"    ssh {node['name']} sudo systemctl restart rke2-server")
-                    out.append(f"    kubectl wait node/{node['name']} --for=condition=Ready --timeout=300s")
-                    out.append(f"    kubectl get node {node['name']} -o jsonpath='{{.status.nodeInfo.kubeletVersion}}'")
-                    out.append(f"    # verify etcd healthy before proceeding to the next server:")
-                    out.append(f"    kubectl -n kube-system exec -it etcd-{node['name']} -- etcdctl endpoint health \\")
-                    out.append(f"      --cacert /var/lib/rancher/rke2/server/tls/etcd/server-ca.crt \\")
-                    out.append(f"      --cert   /var/lib/rancher/rke2/server/tls/etcd/server-client.crt \\")
-                    out.append(f"      --key    /var/lib/rancher/rke2/server/tls/etcd/server-client.key")
-                    out.append("")
-            else:
-                out.append( "    # (no server nodes in state.json — substitute hostnames)")
-                out.append(f"    ssh <server-node> sudo dnf install -y \\")
-                out.append(f"      {srv_pkg} {com_pkg} {sel_pkg}")
-                out.append( "    ssh <server-node> sudo systemctl restart rke2-server")
-                out.append( "    kubectl wait node/<server-node> --for=condition=Ready --timeout=300s")
-                out.append( "    # verify etcd healthy before proceeding to the next server:")
-                out.append( "    kubectl -n kube-system exec -it etcd-<server-node> -- etcdctl endpoint health \\")
-                out.append( "      --cacert /var/lib/rancher/rke2/server/tls/etcd/server-ca.crt \\")
-                out.append( "      --cert   /var/lib/rancher/rke2/server/tls/etcd/server-client.crt \\")
-                out.append( "      --key    /var/lib/rancher/rke2/server/tls/etcd/server-client.key")
-                out.append("")
-
-            out.append(f"  [{el}] Agent nodes — one at a time (only after ALL servers are Ready):")
-            out.append("")
-            if agents:
-                for node in agents:
-                    out.append(f"    # {node['name']}")
-                    out.append(f"    ssh {node['name']} sudo dnf install -y \\")
-                    out.append(f"      {agt_pkg} \\")
-                    out.append(f"      {com_pkg} \\")
-                    out.append(f"      {sel_pkg}")
-                    out.append(f"    ssh {node['name']} sudo systemctl restart rke2-agent")
-                    out.append(f"    kubectl wait node/{node['name']} --for=condition=Ready --timeout=300s")
-                    out.append(f"    kubectl get node {node['name']} -o jsonpath='{{.status.nodeInfo.kubeletVersion}}'")
-                    out.append("")
-            else:
-                out.append( "    # (no agent nodes recorded — substitute hostnames if applicable)")
-                out.append(f"    ssh <agent-node> sudo dnf install -y \\")
-                out.append(f"      {agt_pkg} {com_pkg} {sel_pkg}")
-                out.append( "    ssh <agent-node> sudo systemctl restart rke2-agent")
-                out.append( "    kubectl wait node/<agent-node> --for=condition=Ready --timeout=300s")
-                out.append("")
-
-    out.append(sep("="))
-    out.append("POST-UPGRADE CHECKS")
-    out.append(sep("="))
-    out.append("  kubectl get nodes   # all Ready at target version")
-    out.append("  kubectl get pods -A # no crashlooping pods")
-    out.append("")
-    out.append("  Helm-deployed deps (longhorn, cert-manager) are STAGED in the")
-    out.append("  hauler bundle but NOT automatically upgraded — run helm upgrade")
-    out.append("  for each separately when ready.")
-    out.append("")
-
-    return "\n".join(out)
+    # --- 4. Helm deps (staged, not driven by this tool) ---------------------
+    if charts:
+        L.append("## 4. Helm dependencies (staged — upgrade separately)")
+        L.append("")
+        L.append("These charts + their images are in the hauler store, but this "
+                 "tool does **not** drive their upgrade (they're not part of "
+                 "RKE2's bundled set). Run `helm upgrade` against the hauler "
+                 "registry on your own schedule:")
+        L.append("")
+        for c in charts:
+            L.append(f"- `{c['name']}` -> chart `{c['version']}`")
+        L.append("")
+    return "\n".join(L) + "\n"
 
 
-# ----------------------------------------------------------------------------
-# ingest (offline hauler VM)
-# ----------------------------------------------------------------------------
-HAULER_UNIT_PATH = "/etc/systemd/system/hauler@.service"
-HAULER_UNIT_TMPL = """# managed by airgap_update.py
-[Unit]
-Description=Hauler Serve %I Service
-
-[Service]
-Environment="HOME={work_dir}/"
-ExecStart=/usr/local/bin/hauler store serve %i -s {store_dir}
-WorkingDirectory={work_dir}/
-Restart=always
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-"""
+def write_runbook(path, els, rpm_bundle, hauler_bundle, store_dir, repo_host,
+                  selinux_version, charts):
+    text = render_runbook(path, els, rpm_bundle, hauler_bundle, store_dir,
+                          repo_host, selinux_version, charts)
+    with open(RUNBOOK_PATH, "w") as fh:
+        fh.write(text)
+    info(f"wrote {RUNBOOK_PATH} ({len(path)}-step path, EL: {', '.join(els)})")
 
 
-def detect_host(config):
-    advertised = config.get("hauler", {}).get("advertise_host")
-    if advertised:
-        return advertised
-    rc, out, _ = run(["hostname", "-I"], check=False)
-    host = out.split()[0] if out.split() else None
-    if not host:
-        fatal("could not detect host IP; set hauler.advertise_host in config.json")
-    warn(f"hauler.advertise_host not set; using detected {host}")
-    return host
-
-
-def ensure_hauler_unit(work_dir, store_dir):
-    desired = HAULER_UNIT_TMPL.format(work_dir=work_dir, store_dir=store_dir)
-    existing = ""
-    if os.path.exists(HAULER_UNIT_PATH):
-        with open(HAULER_UNIT_PATH) as fh:
-            existing = fh.read()
-    if existing != desired:
-        with open(HAULER_UNIT_PATH, "w") as fh:
-            fh.write(desired)
-        run(["systemctl", "daemon-reload"])
-        info(f"wrote {HAULER_UNIT_PATH}")
-
-
-def hauler_env(store_dir, work_dir):
-    env = os.environ.copy()
-    env["HAULER_STORE_DIR"] = store_dir
-    env["HOME"] = work_dir
-    return env
-
-
-def cmd_ingest(args):
-    """Load the hauler bundle (images + charts) into the serving store.
-
-    RPMs are handled separately on the dnf repo server — not here.
-    """
-    if os.geteuid() != 0:
-        fatal("ingest must run as root (systemctl / /etc writes) on the offline hauler VM")
-
+def cmd_runbook(args):
+    """Regenerate RUNBOOK.md from the last build recorded in state.json."""
     config = load_json(args.config) or {}
-    hcfg = config.get("hauler", {})
-    work_dir = hcfg.get("work_dir", "/opt/hauler")
-    store_dir = hcfg.get("store_dir", "/opt/hauler/store")
-    reg_port = hcfg.get("registry_port", 5000)
-    fs_port = hcfg.get("fileserver_port", 8080)
-
-    require("hauler")
-    bundle = os.path.abspath(args.bundle)
-    if not os.path.exists(bundle):
-        fatal(f"bundle not found: {bundle}")
-
-    env = hauler_env(store_dir, work_dir)
-
-    # 1) load the carried store (images + charts)
-    #    hauler v1.4.3: `store load -f <haul>` (NOT positional); -s sets dest store.
-    warn(f"loading {bundle} into store {store_dir} (this can take a while)...")
-    run(["hauler", "store", "load", "-f", bundle, "-s", store_dir], env=env)
-    info("store loaded")
-
-    # 2) ensure systemd units, (re)start registry + fileserver (charts/files)
-    ensure_hauler_unit(work_dir, store_dir)
-    for svc in ("hauler@registry", "hauler@fileserver"):
-        run(["systemctl", "enable", svc], check=False)
-        run(["systemctl", "restart", svc])
-        info(f"  {svc} restarted")
-
-    # 3) store index (handy for operators to see what's served)
-    host = detect_host(config)
-    rc, out, _ = run(["hauler", "store", "info", "-s", store_dir], env=env, check=False)
-    if rc == 0:
-        info("store contents:")
-        print(out.rstrip())
-
-    print()
-    info("ingest complete. hauler serving:")
-    print(f"    registry   : http://{host}:{reg_port}  (images + OCI helm charts)")
-    print(f"    fileserver : http://{host}:{fs_port}   (files; empty unless Files staged)")
-    print()
-    warn("RPMs are delivered separately: extract rpms_*.tar.zst on the dnf repo "
-         "server (releasever-split) + createrepo_c + chcon -Rt httpd_sys_content_t.")
-
-    # Print the runbook if one was recorded for this bundle
-    state = load_json(args.state) if hasattr(args, "state") else {}
-    lb = (state or {}).get("last_build", {})
-    runbook_file = lb.get("runbook")
-    if runbook_file and os.path.exists(runbook_file):
-        print()
-        info(f"upgrade runbook ({runbook_file}):")
-        with open(runbook_file) as fh:
-            print(fh.read())
-    else:
-        print()
-        warn("No runbook found — re-run 'build' to generate one, or refer to OPERATOR.md.")
+    state = load_json(args.state) or {}
+    lb = state.get("last_build") or {}
+    path = lb.get("rke2_path")
+    if not path:
+        fatal("no recorded build in state.json — run `build` first")
+    els = lb.get("els") or config.get("el_versions") or [config.get("el_version")]
+    store_dir = config.get("hauler", {}).get("store_dir", "/opt/hauler/store")
+    repo_host = config.get("dnf_repo", {}).get("host", "the dnf repo server")
+    selinux_version = config.get("rke2", {}).get("selinux_version", "")
+    charts = [{"name": n, "version": v}
+              for n, v in (lb.get("targets", {}).get("helm_deps") or {}).items()]
+    write_runbook(path, els, lb.get("rpm_bundle"), lb.get("hauler_bundle"),
+                  store_dir, repo_host, selinux_version, charts)
 
 
 # ----------------------------------------------------------------------------
@@ -967,7 +843,7 @@ def cmd_ingest(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="airgap_update.py",
-        description="Build and ingest hauler bundles for in-place RKE2 airgap updates.",
+        description="Download artifacts and generate the apply runbook for in-place RKE2 airgap updates.",
     )
     parser.add_argument("--config", default="config.json", help="path to config.json")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -984,14 +860,11 @@ def main():
     p_build.add_argument("--target", default=None, help="target minor or version, e.g. 1.34 (skip prompt)")
     p_build.add_argument("--deps-latest", action="store_true", help="take latest for all helm deps")
     p_build.add_argument("--no-input", action="store_true", help="non-interactive; use defaults")
-    p_build.add_argument("--no-helm-images", action="store_true",
-                         help="skip helm-template image resolution (for debugging or charts-only builds)")
     p_build.set_defaults(func=cmd_build)
 
-    p_ing = sub.add_parser("ingest", help="load a bundle into the serving hauler store")
-    p_ing.add_argument("bundle", help="path to the .tar.zst bundle")
-    p_ing.add_argument("--state", default="state.json", help="path to state.json (for runbook)")
-    p_ing.set_defaults(func=cmd_ingest)
+    p_run = sub.add_parser("runbook", help="(re)generate RUNBOOK.md from the last build in state.json")
+    p_run.add_argument("--state", default="state.json", help="path to state.json")
+    p_run.set_defaults(func=cmd_runbook)
 
     args = parser.parse_args()
     args.func(args)
